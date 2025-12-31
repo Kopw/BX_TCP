@@ -34,6 +34,14 @@
 
 #define TCP_BRUTAL_PARAMS 23301
 
+// Global rate limiting (bytes per second), 0 = disabled
+static u64 global_rate = 0;
+module_param(global_rate, ullong, 0644);
+MODULE_PARM_DESC(global_rate, "Global rate limit in bytes/sec (0=disabled)");
+
+// Active connection counter for fair share calculation
+static atomic_t active_connections = ATOMIC_INIT(0);
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
 static u64 tcp_sock_get_sec(const struct tcp_sock *tp)
 {
@@ -165,6 +173,15 @@ static void brutal_init(struct sock *sk)
     // See https://github.com/torvalds/linux/commit/218af599fa635b107cfe10acf3249c4dfe5e4123 for details.
     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 #endif
+
+    // Increment global connection counter
+    atomic_inc(&active_connections);
+}
+
+static void brutal_release(struct sock *sk)
+{
+    // Decrement global connection counter
+    atomic_dec(&active_connections);
 }
 
 // Copied from tcp.h for compatibility reasons
@@ -216,6 +233,16 @@ static void brutal_update_rate(struct sock *sk)
 
     rate *= 100;
     rate = div_u64(rate, ack_rate);
+
+    // Apply global rate limiting if enabled
+    if (global_rate > 0) {
+        int conn_count = atomic_read(&active_connections);
+        u64 fair_share;
+        if (conn_count < 1)
+            conn_count = 1;
+        fair_share = div_u64(global_rate, conn_count);
+        rate = min_t(u64, rate, fair_share);
+    }
 
     // The order here is chosen carefully to avoid overflow as much as possible
     cwnd = div_u64(rate, MSEC_PER_SEC);
@@ -281,6 +308,7 @@ static struct tcp_congestion_ops tcp_brutal_ops = {
     .name = "brutal",
     .owner = THIS_MODULE,
     .init = brutal_init,
+    .release = brutal_release,
     .cong_control = brutal_main,
     .undo_cwnd = brutal_undo_cwnd,
     .ssthresh = brutal_ssthresh,
